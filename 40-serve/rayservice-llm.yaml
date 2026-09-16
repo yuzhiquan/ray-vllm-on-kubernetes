@@ -1,9 +1,9 @@
 # Stage 4: online serving. RayService + Ray Serve LLM, exposing an OpenAI-compatible API.
 #
 # import_path points at Ray's own builder: ray.serve.llm:build_openai_app,
-# and args are just the fields of LLMConfig. model_source points at a symlink on the
-# shared volume, so "you serve whatever training exported"; switching versions only
-# requires repointing the symlink + triggering one upgrade.
+# and args are just the fields of LLMConfig. model_source must name an immutable version
+# directory and must not point at a symlink — see the comment on model_source below for
+# why. Releasing a new version means editing that line and applying.
 apiVersion: ray.io/v1
 kind: RayService
 metadata:
