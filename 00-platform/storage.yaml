@@ -1,0 +1,41 @@
+# The only handoff surface between the four stages: one ReadWriteMany volume.
+#
+#   /mnt/cluster_storage/data/raw          raw samples (jsonl)
+#   /mnt/cluster_storage/data/tokenized    data-processing artifacts (parquet)
+#   /mnt/cluster_storage/train/            storage_path for Ray Train
+#   /mnt/cluster_storage/models/sft-<id>/  exported weights in HF format
+#   /mnt/cluster_storage/models/sft-current -> symlink to the version currently live
+#   /mnt/cluster_storage/outputs/batch/    offline batch inference results
+#
+# RWX is a hard requirement: training workers are spread across several nodes,
+# and Ray Train explicitly requires storage_path to point at shared storage for
+# multi-node runs. Without an RWX StorageClass, switch to S3/GCS
+# (RunConfig(storage_path="s3://..."), bucket_uri for model_source); see
+# "What to do without an RWX volume" in the README.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: llm-shared
+  namespace: llm-pipeline
+  labels:
+    app: llm-e2e
+    version: "2.58.0"
+    component: storage
+spec:
+  accessModes:
+    - ReadWriteMany
+  # Must be replaced with a StorageClass in your cluster that really supports
+  # RWX: efs-sc on EKS, standard-rwx / Filestore CSI on GKE, or
+  # nfs-subdir-external-provisioner if you run it yourself.
+  #
+  # Do not write storageClassName: "". In Kubernetes an explicit empty string
+  # means "use no StorageClass at all", which **disables** dynamic provisioning
+  # by the default class; the PVC can then only bind to a static PV that is
+  # likewise class-less, and otherwise stays Pending forever. To use the default
+  # class you omit the field entirely — but the default class usually supports
+  # RWO only, which breaks multi-node training, so an explicit value is required
+  # here.
+  storageClassName: REPLACE_WITH_RWX_STORAGE_CLASS
+  resources:
+    requests:
+      storage: 200Gi

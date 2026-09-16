@@ -1,0 +1,168 @@
+# Stage 2: SFT training. The head takes no GPU, 2 workers with 1 GPU each.
+#
+# NUM_WORKERS must equal the total number of GPU workers (replicas x GPUs per
+# Pod), otherwise Ray Train never gets enough workers and the job is stuck in
+# Initializing.
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: llm-train-sft
+  namespace: llm-pipeline
+  labels:
+    app: llm-e2e
+    version: "2.58.0"
+    component: train
+spec:
+  entrypoint: python /home/ray/scripts/train_sft.py
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 600
+  # Upper bound on training time; on timeout KubeRay terminates the job so a hung
+  # job cannot hold GPUs hostage.
+  activeDeadlineSeconds: 14400
+  rayClusterSpec:
+    rayVersion: "2.58.0"
+    headGroupSpec:
+      # The head explicitly declares 0 GPU: training actors should not be
+      # scheduled onto the head.
+      rayStartParams:
+        num-gpus: "0"
+      template:
+        metadata:
+          labels:
+            app: llm-e2e
+            version: "2.58.0"
+            component: train
+        spec:
+          containers:
+            - name: ray-head
+              image: rayproject/ray-llm:2.58.0-py312-cu130
+              imagePullPolicy: IfNotPresent
+              ports:
+                - containerPort: 6379
+                  name: gcs
+                - containerPort: 8265
+                  name: dashboard
+                - containerPort: 10001
+                  name: client
+              env:
+                - name: SHARED_DIR
+                  value: /mnt/cluster_storage
+                - name: BASE_MODEL
+                  value: Qwen/Qwen2.5-0.5B-Instruct
+                - name: NUM_WORKERS
+                  value: "2"
+                # ddp | fsdp. ddp is faster for 0.5B; switch to fsdp at 7B and above.
+                - name: PARALLEL_STRATEGY
+                  value: ddp
+                - name: EPOCHS
+                  value: "2"
+                - name: BATCH_SIZE
+                  value: "4"
+                - name: LR
+                  value: "1e-5"
+                # Rows in the local shuffle buffer. Too small is the same as no
+                # shuffle, too large eats memory.
+                - name: SHUFFLE_BUFFER
+                  value: "1024"
+                - name: SEED
+                  value: "42"
+                - name: HUGGING_FACE_HUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-token
+                      key: hf_token
+                      optional: true
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 8Gi
+                limits:
+                  cpu: "4"
+                  memory: 12Gi
+              volumeMounts:
+                - name: share
+                  mountPath: /shared
+                - name: cluster-storage
+                  mountPath: /mnt/cluster_storage
+                - name: scripts
+                  mountPath: /home/ray/scripts
+          volumes:
+            - name: share
+              emptyDir: {}
+            - name: cluster-storage
+              persistentVolumeClaim:
+                claimName: llm-shared
+            - name: scripts
+              configMap:
+                name: llm-e2e-scripts
+    workerGroupSpecs:
+      - groupName: gpu-group
+        replicas: 2
+        minReplicas: 2
+        maxReplicas: 2
+        numOfHosts: 1
+        rayStartParams: {}
+        template:
+          metadata:
+            labels:
+              app: llm-e2e
+              version: "2.58.0"
+              component: train
+          spec:
+            # GPU nodes usually carry a taint; enable these to match your cluster.
+            # tolerations:
+            #   - key: nvidia.com/gpu
+            #     operator: Exists
+            #     effect: NoSchedule
+            # nodeSelector:
+            #   node.kubernetes.io/instance-type: g5.xlarge
+            containers:
+              - name: ray-worker
+                image: rayproject/ray-llm:2.58.0-py312-cu130
+                imagePullPolicy: IfNotPresent
+                env:
+                  - name: SHARED_DIR
+                    value: /mnt/cluster_storage
+                  # Inside a container NCCL may pick the wrong NIC by default;
+                  # check these two first when you see a hang.
+                  - name: NCCL_DEBUG
+                    value: WARN
+                  - name: HUGGING_FACE_HUB_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token
+                        key: hf_token
+                        optional: true
+                resources:
+                  requests:
+                    cpu: "8"
+                    memory: 48Gi
+                    nvidia.com/gpu: "1"
+                  limits:
+                    cpu: "8"
+                    memory: 48Gi
+                    nvidia.com/gpu: "1"
+                volumeMounts:
+                  - name: share
+                    mountPath: /shared
+                  - name: cluster-storage
+                    mountPath: /mnt/cluster_storage
+                  - name: scripts
+                    mountPath: /home/ray/scripts
+                  # PyTorch's DataLoader and NCCL both use /dev/shm; the 64MB
+                  # default leads straight to a hung training run or a bus error.
+                  - name: shared-memory
+                    mountPath: /dev/shm
+            volumes:
+              - name: share
+                emptyDir: {}
+              - name: cluster-storage
+                persistentVolumeClaim:
+                  claimName: llm-shared
+              - name: scripts
+                configMap:
+                  name: llm-e2e-scripts
+              - name: shared-memory
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 8Gi

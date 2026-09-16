@@ -1,0 +1,129 @@
+# Stage 1: data processing. A CPU-only cluster, destroyed as soon as it finishes.
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: llm-data-prep
+  namespace: llm-pipeline
+  labels:
+    app: llm-e2e
+    version: "2.58.0"
+    component: data-prep
+spec:
+  entrypoint: python /home/ray/scripts/prepare_data.py
+  # Data processing is a one-shot job: reclaim the RayCluster along with the job
+  # when it finishes, leaving 300s for log collection.
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 300
+  activeDeadlineSeconds: 3600
+  rayClusterSpec:
+    rayVersion: "2.58.0"
+    headGroupSpec:
+      rayStartParams: {}
+      template:
+        metadata:
+          labels:
+            app: llm-e2e
+            version: "2.58.0"
+            component: data-prep
+        spec:
+          containers:
+            - name: ray-head
+              image: rayproject/ray-llm:2.58.0-py312-cu130
+              imagePullPolicy: IfNotPresent
+              ports:
+                - containerPort: 6379
+                  name: gcs
+                - containerPort: 8265
+                  name: dashboard
+                - containerPort: 10001
+                  name: client
+              env:
+                - name: SHARED_DIR
+                  value: /mnt/cluster_storage
+                - name: BASE_MODEL
+                  value: Qwen/Qwen2.5-0.5B-Instruct
+                - name: MAX_LEN
+                  value: "1024"
+                - name: TOKENIZE_CONCURRENCY
+                  value: "2"
+                - name: HUGGING_FACE_HUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-token
+                      key: hf_token
+                      optional: true
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 8Gi
+                limits:
+                  cpu: "4"
+                  memory: 12Gi
+              # Probes are left to KubeRay's injection: v1.7.0 uses httpGet
+              # :52365/api/healthz for Ray >= 2.53; hand-writing them goes wrong easily.
+              volumeMounts:
+                - name: share
+                  mountPath: /shared
+                - name: cluster-storage
+                  mountPath: /mnt/cluster_storage
+                - name: scripts
+                  mountPath: /home/ray/scripts
+          volumes:
+            - name: share
+              emptyDir: {}
+            - name: cluster-storage
+              persistentVolumeClaim:
+                claimName: llm-shared
+            - name: scripts
+              configMap:
+                name: llm-e2e-scripts
+    workerGroupSpecs:
+      - groupName: cpu-group
+        replicas: 2
+        minReplicas: 2
+        maxReplicas: 2
+        numOfHosts: 1
+        rayStartParams: {}
+        template:
+          metadata:
+            labels:
+              app: llm-e2e
+              version: "2.58.0"
+              component: data-prep
+          spec:
+            containers:
+              - name: ray-worker
+                image: rayproject/ray-llm:2.58.0-py312-cu130
+                imagePullPolicy: IfNotPresent
+                env:
+                  - name: SHARED_DIR
+                    value: /mnt/cluster_storage
+                  - name: HUGGING_FACE_HUB_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token
+                        key: hf_token
+                        optional: true
+                resources:
+                  requests:
+                    cpu: "4"
+                    memory: 12Gi
+                  limits:
+                    cpu: "8"
+                    memory: 16Gi
+                volumeMounts:
+                  - name: share
+                    mountPath: /shared
+                  - name: cluster-storage
+                    mountPath: /mnt/cluster_storage
+                  - name: scripts
+                    mountPath: /home/ray/scripts
+            volumes:
+              - name: share
+                emptyDir: {}
+              - name: cluster-storage
+                persistentVolumeClaim:
+                  claimName: llm-shared
+              - name: scripts
+                configMap:
+                  name: llm-e2e-scripts

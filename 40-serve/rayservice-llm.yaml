@@ -1,0 +1,235 @@
+# Stage 4: online serving. RayService + Ray Serve LLM, exposing an OpenAI-compatible API.
+#
+# import_path points at Ray's own builder: ray.serve.llm:build_openai_app,
+# and args are just the fields of LLMConfig. model_source points at a symlink on the
+# shared volume, so "you serve whatever training exported"; switching versions only
+# requires repointing the symlink + triggering one upgrade.
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: llm-serve
+  namespace: llm-pipeline
+  labels:
+    app: llm-e2e
+    version: "2.58.0"
+    component: serve
+spec:
+  # NewCluster: bring up a pending cluster first, switch traffic once it is ready,
+  # then reclaim the old cluster. The price is that GPU demand doubles during the
+  # upgrade window — when GPUs are tight, switch to
+  # NewClusterWithIncrementalUpgrade (beta, on by default since v1.7.0, needs Gateway).
+  upgradeStrategy:
+    type: NewCluster
+  # Note: deploymentUnhealthySecondThreshold / serviceUnhealthySecondThreshold
+  # are marked "Deprecated: This field is not used anymore" in KubeRay v1.7.0
+  # (see rayservice_types.go). Setting them has no effect, so they are omitted here.
+  # Slow loading is covered by the worker's liveness failureThreshold; see the probe
+  # comments below.
+  serveConfigV2: |
+    applications:
+      - name: llm
+        import_path: ray.serve.llm:build_openai_app
+        route_prefix: "/"
+        args:
+          llm_configs:
+            - model_loading_config:
+                # The name clients put in the model field. It is a stable external
+                # contract and does not change with the underlying weight version.
+                model_id: sft-qwen
+                # Must be an **immutable version directory**; it must not point at the
+                # models/sft-current symlink: weights already loaded into GPU memory are
+                # not reloaded just because a symlink on disk changed, whereas editing
+                # this line is what actually triggers a Serve application update.
+                # Releasing a new version = replace this with the new sft-<RUN_ID>, then apply.
+                model_source: /mnt/cluster_storage/models/REPLACE_WITH_SFT_RUN_ID
+              engine_kwargs:
+                max_model_len: 4096
+                gpu_memory_utilization: 0.85
+                enable_prefix_caching: true
+                enable_chunked_prefill: true
+                tensor_parallel_size: 1
+              deployment_config:
+                autoscaling_config:
+                  min_replicas: 1
+                  max_replicas: 4
+                  # Scale on "in-flight requests per replica", not CPU utilization.
+                  target_ongoing_requests: 32
+                max_ongoing_requests: 64
+              # Turn on vLLM engine metrics so Prometheus can scrape TTFT / queue depth.
+              log_engine_metrics: true
+  rayClusterConfig:
+    rayVersion: "2.58.0"
+    # Must be enabled: Serve's autoscaling_config only decides the number of Serve
+    # replicas. Those replicas have to land on Ray workers, and adding worker Pods is
+    # the Ray autoscaler's job. Without this switch, maxReplicas in workerGroupSpecs is
+    # decorative — the cluster will only ever have `replicas` workers, so Serve cannot
+    # scale past that either.
+    enableInTreeAutoscaling: true
+    autoscalerOptions:
+      # Idle wait before scaling down. Model loading is expensive; do not let the
+      # autoscaler flap.
+      idleTimeoutSeconds: 300
+      upscalingMode: Default
+      resources:
+        requests:
+          cpu: 200m
+          memory: 256Mi
+        limits:
+          cpu: "1"
+          memory: 1Gi
+    headGroupSpec:
+      # The head does not take part in inference: declare 0 GPU explicitly so engine
+      # replicas are never scheduled onto the head.
+      rayStartParams:
+        num-gpus: "0"
+      template:
+        metadata:
+          labels:
+            app: llm-e2e
+            version: "2.58.0"
+            component: serve-head
+        spec:
+          containers:
+            - name: ray-head
+              image: rayproject/ray-llm:2.58.0-py312-cu130
+              imagePullPolicy: IfNotPresent
+              ports:
+                - containerPort: 6379
+                  name: gcs
+                - containerPort: 8265
+                  name: dashboard
+                - containerPort: 10001
+                  name: client
+                - containerPort: 8000
+                  name: serve
+                - containerPort: 8080
+                  name: metrics
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 8Gi
+                limits:
+                  cpu: "4"
+                  memory: 12Gi
+              # The two probes below replicate the default behavior KubeRay v1.7.0
+              # injects for Ray >= 2.53 (the unified health endpoint
+              # :52365/api/healthz). They are spelled out so that failureThreshold can
+              # be tuned; delete them and KubeRay will inject an equivalent config.
+              livenessProbe:
+                httpGet:
+                  path: /api/healthz
+                  port: 52365
+                initialDelaySeconds: 30
+                periodSeconds: 5
+                timeoutSeconds: 5
+                failureThreshold: 120
+              readinessProbe:
+                httpGet:
+                  path: /api/healthz
+                  port: 52365
+                initialDelaySeconds: 10
+                periodSeconds: 5
+                timeoutSeconds: 5
+                failureThreshold: 10
+              volumeMounts:
+                - name: share
+                  mountPath: /shared
+                - name: cluster-storage
+                  mountPath: /mnt/cluster_storage
+          volumes:
+            - name: share
+              emptyDir: {}
+            - name: cluster-storage
+              persistentVolumeClaim:
+                claimName: llm-shared
+    workerGroupSpecs:
+      - groupName: gpu-group
+        replicas: 1
+        minReplicas: 1
+        maxReplicas: 4
+        numOfHosts: 1
+        rayStartParams: {}
+        template:
+          metadata:
+            labels:
+              app: llm-e2e
+              version: "2.58.0"
+              component: serve-worker
+          spec:
+            # Streaming responses are cut off when the Pod terminates. Give the engine
+            # enough time to finish in-flight requests; this value must be larger than
+            # the p99 generation time of a single request.
+            terminationGracePeriodSeconds: 300
+            containers:
+              - name: ray-worker
+                image: rayproject/ray-llm:2.58.0-py312-cu130
+                imagePullPolicy: IfNotPresent
+                ports:
+                  - containerPort: 8000
+                    name: serve
+                env:
+                  - name: HUGGING_FACE_HUB_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token
+                        key: hf_token
+                        optional: true
+                resources:
+                  requests:
+                    cpu: "8"
+                    memory: 32Gi
+                    nvidia.com/gpu: "1"
+                  limits:
+                    cpu: "8"
+                    memory: 32Gi
+                    nvidia.com/gpu: "1"
+                # Critical: a serve worker's readiness must check both the raylet and
+                # the Serve proxy. KubeRay only injects this combined probe when the
+                # user has not written a readinessProbe — the moment you write your own
+                # and forget /-/healthz, the Pod is added to Endpoints while the engine
+                # is still loading, and requests get a straight 5xx.
+                readinessProbe:
+                  exec:
+                    command:
+                      - bash
+                      - -c
+                      - >-
+                        wget --tries 1 -T 2 -q -O-
+                        http://localhost:52365/api/local_raylet_healthz | grep success &&
+                        wget --tries 1 -T 5 -q -O-
+                        http://localhost:8000/-/healthz | grep success
+                  initialDelaySeconds: 10
+                  periodSeconds: 5
+                  timeoutSeconds: 10
+                  # Remove from the endpoint set after a single failure: a brief
+                  # NotReady is far better than sending requests to an engine that is
+                  # still loading the model or has already hung.
+                  failureThreshold: 1
+                # Model loading must not be interrupted by liveness.
+                # 120 x 5s = a 600s tolerance window; scale it up for 7B and above
+                # according to actual load time.
+                livenessProbe:
+                  httpGet:
+                    path: /api/healthz
+                    port: 52365
+                  initialDelaySeconds: 60
+                  periodSeconds: 5
+                  timeoutSeconds: 5
+                  failureThreshold: 120
+                volumeMounts:
+                  - name: share
+                    mountPath: /shared
+                  - name: cluster-storage
+                    mountPath: /mnt/cluster_storage
+                  - name: shared-memory
+                    mountPath: /dev/shm
+            volumes:
+              - name: share
+                emptyDir: {}
+              - name: cluster-storage
+                persistentVolumeClaim:
+                  claimName: llm-shared
+              - name: shared-memory
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 8Gi

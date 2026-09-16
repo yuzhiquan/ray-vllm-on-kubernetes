@@ -1,0 +1,132 @@
+# Stage 3: offline batch inference / evaluation. 1 GPU worker, torn down when done.
+#
+# Relationship to stage 4: the same weights, the same vLLM engine; the only
+# difference is whether there is an HTTP layer and a latency target. The batch
+# case pushes both batch_size and gpu_memory_utilization to the limit.
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: llm-batch-infer
+  namespace: llm-pipeline
+  labels:
+    app: llm-e2e
+    version: "2.58.0"
+    component: batch-infer
+spec:
+  entrypoint: python /home/ray/scripts/batch_infer.py
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 300
+  activeDeadlineSeconds: 7200
+  rayClusterSpec:
+    rayVersion: "2.58.0"
+    headGroupSpec:
+      rayStartParams:
+        num-gpus: "0"
+      template:
+        metadata:
+          labels:
+            app: llm-e2e
+            version: "2.58.0"
+            component: batch-infer
+        spec:
+          containers:
+            - name: ray-head
+              image: rayproject/ray-llm:2.58.0-py312-cu130
+              imagePullPolicy: IfNotPresent
+              ports:
+                - containerPort: 6379
+                  name: gcs
+                - containerPort: 8265
+                  name: dashboard
+                - containerPort: 10001
+                  name: client
+              env:
+                - name: SHARED_DIR
+                  value: /mnt/cluster_storage
+                - name: MODEL_PATH
+                  value: /mnt/cluster_storage/models/sft-current
+                - name: CONCURRENCY
+                  value: "1"
+                - name: BATCH_SIZE
+                  value: "32"
+                - name: TENSOR_PARALLEL_SIZE
+                  value: "1"
+                - name: MAX_MODEL_LEN
+                  value: "2048"
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 8Gi
+                limits:
+                  cpu: "4"
+                  memory: 12Gi
+              volumeMounts:
+                - name: share
+                  mountPath: /shared
+                - name: cluster-storage
+                  mountPath: /mnt/cluster_storage
+                - name: scripts
+                  mountPath: /home/ray/scripts
+          volumes:
+            - name: share
+              emptyDir: {}
+            - name: cluster-storage
+              persistentVolumeClaim:
+                claimName: llm-shared
+            - name: scripts
+              configMap:
+                name: llm-e2e-scripts
+    workerGroupSpecs:
+      - groupName: gpu-group
+        replicas: 1
+        minReplicas: 1
+        maxReplicas: 1
+        numOfHosts: 1
+        rayStartParams: {}
+        template:
+          metadata:
+            labels:
+              app: llm-e2e
+              version: "2.58.0"
+              component: batch-infer
+          spec:
+            containers:
+              - name: ray-worker
+                image: rayproject/ray-llm:2.58.0-py312-cu130
+                imagePullPolicy: IfNotPresent
+                env:
+                  - name: SHARED_DIR
+                    value: /mnt/cluster_storage
+                resources:
+                  requests:
+                    cpu: "8"
+                    memory: 32Gi
+                    nvidia.com/gpu: "1"
+                  limits:
+                    cpu: "8"
+                    memory: 32Gi
+                    nvidia.com/gpu: "1"
+                volumeMounts:
+                  - name: share
+                    mountPath: /shared
+                  - name: cluster-storage
+                    mountPath: /mnt/cluster_storage
+                  - name: scripts
+                    mountPath: /home/ray/scripts
+                  - name: shared-memory
+                    mountPath: /dev/shm
+            volumes:
+              - name: share
+                emptyDir: {}
+              - name: cluster-storage
+                persistentVolumeClaim:
+                  claimName: llm-shared
+              - name: scripts
+                configMap:
+                  name: llm-e2e-scripts
+              # vLLM multiprocessing / TP communication goes through shared
+              # memory, and the default 64MB is not enough.
+              - name: shared-memory
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 8Gi

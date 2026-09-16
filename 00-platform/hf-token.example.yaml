@@ -1,0 +1,19 @@
+# Only needed for pulling gated models (the Llama family and similar). The
+# Qwen2.5 family is publicly downloadable, so you can skip this; the Pods in
+# all four stages reference this Secret with optional: true.
+#
+# Do not commit a real token to the repository. Create it for real with:
+#   kubectl -n llm-pipeline create secret generic hf-token \
+#     --from-literal=hf_token="$HF_TOKEN"
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hf-token
+  namespace: llm-pipeline
+  labels:
+    app: llm-e2e
+    version: "2.58.0"
+    component: platform
+type: Opaque
+stringData:
+  hf_token: REPLACE_ME
