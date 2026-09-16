@@ -1,486 +1,289 @@
-# A complete LLM pipeline on K8s + Ray + PyTorch + vLLM
+# A four-stage LLM pipeline on Kubernetes: Ray + PyTorch + vLLM
 
-On a single Kubernetes cluster, wire data processing, training, offline inference and
-online serving into one chain, where every stage can be submitted and accepted on its
-own and artifacts are handed off through one shared volume.
+Runnable code and manifests for a complete LLM chain on one Kubernetes cluster —
+data processing, SFT training, offline batch inference, online serving — where each
+stage submits independently and artifacts are handed off through a single shared volume.
 
-This repository is runnable, not illustrative pseudo-code. Every API and field was
-checked on 2026-09-14 against the source / official samples of Ray 2.58.0 and
-KubeRay v1.7.0, but it **has not yet been executed end to end on a real GPU cluster** —
-see "How far this has actually been verified" at the end.
+> **Verification scope, stated up front.** Every API and field here was checked against
+> pinned upstream source (Ray 2.58.0, KubeRay v1.7.0) rather than paraphrased docs, the
+> four Ray custom resources validate against the real KubeRay v1.7.0 CRD schemas, and
+> both shell scripts are exercised against behavioural fixtures. **It has not been
+> executed end to end on a real GPU cluster.** Convergence, memory headroom, load times
+> and probe thresholds all need confirming on your first real run. See
+> [Verification scope](#verification-scope) for the full list of what was and was not checked.
 
-## 1. Start by pinning down who does what
+This repository is code only. The long-form explanation of *why* each line of code and
+each YAML field looks the way it does lives in a separate article series (not yet
+published).
 
-The responsibilities of the four tools do not overlap, and confusing them is the most
-common cause of rework in this pipeline.
+## The chain
 
-| Layer | Component | Responsible for | Not responsible for |
-| --- | --- | --- | --- |
-| Resources | Kubernetes | which node a Pod lands on, quotas, GPU devices, network and storage | has no idea what an epoch or a KV cache is |
-| Orchestration | KubeRay Operator | managing the lifecycle of Ray clusters through RayJob / RayService | no operator-level scheduling, nothing about model loading |
-| Runtime | Ray (Core / Data / Train / Serve) | scheduling tasks and actors inside a cluster made of existing Pods, sharding data, organizing training workers, hosting service replicas | does not request nodes (that is K8s's job); a logical GPU quota is **not** GPU memory isolation |
-| Compute | PyTorch | forward and backward passes, DDP/FSDP communication, the optimizer | nothing about where the data comes from or how replicas scale |
-| Engine | vLLM | continuous batching, PagedAttention, KV cache, the OpenAI-compatible protocol | nothing about replica counts or traffic routing |
-
-In one sentence: **K8s provides resources, KubeRay provides the Ray cluster, Ray
-provides parallelism, PyTorch trains, vLLM infers.**
-
-## 2. The pipeline at a glance
-
-```mermaid
-flowchart TD
-    subgraph K8S["Kubernetes cluster"]
-        OP["KubeRay Operator v1.7.0"]
-
-        subgraph S1["Stage 1 · RayJob (CPU)"]
-            D["Ray Data: filter / dedupe / tokenize"]
-        end
-        subgraph S2["Stage 2 · RayJob (GPU)"]
-            T["Ray Train + PyTorch: DDP or FSDP"]
-        end
-        subgraph S3["Stage 3 · RayJob (GPU)"]
-            B["Ray Data + vLLM: batch generation and evaluation"]
-        end
-        subgraph S4["Stage 4 · RayService (GPU, long-lived)"]
-            V["Ray Serve LLM + vLLM: OpenAI-compatible endpoint"]
-        end
-
-        PVC[("shared RWX volume<br/>llm-shared")]
-    end
-
-    RAW["raw jsonl"] --> D
-    D -->|"tokenized/current symlink"| PVC
-    PVC --> T
-    T -->|"models/sft-current symlink"| PVC
-    PVC --> B
-    PVC --> V
-    V --> CLIENT["OpenAI SDK / gateway"]
-
-    OP -.manages.-> S1
-    OP -.manages.-> S2
-    OP -.manages.-> S3
-    OP -.manages.-> S4
+```
+raw jsonl ──► Ray Data ──────► Ray Train + PyTorch ──► Ray Data + vLLM ──► RayService + vLLM
+              RayJob, CPU      RayJob, GPU             RayJob, GPU          long-running, GPU
+              tokenize         SFT, export as a        batch generate       OpenAI-compatible
+              + holdout        HuggingFace directory   + acceptance gate    endpoint
 ```
 
-The key design decision: **artifacts are written under a per-run version, version
-directories are created exclusively, and old versions are never overwritten.** The two
-symlinks `data/tokenized/current` and `models/sft-current` are **a convenience entry
-point for humans**, not a concurrency-safe data contract. The concrete guarantees and
-their limits:
+Each stage's output is the next stage's **direct input — there is no conversion script
+anywhere in the chain.** Three decisions make that hold:
 
-| Guarantee | How it is achieved |
-| --- | --- |
-| A rerun does not overwrite old artifacts | the version directory is created with `mkdir()` without `exist_ok`, so an existing one `raise`s immediately |
-| Consumers see one consistent version | **the consumer calls `resolve()` once when the job starts** (stage 2's `resolve_data_version`, stage 3's `Path.resolve`) and then only uses the resolved result |
-| What was evaluated and what went live are the same bytes | stage 3 writes the resolved version into `acceptance.json`, and stage 4's `model_source` names that same immutable version |
-| Rollback is possible | old version directories are kept forever; rollback = set `model_source` back to the old version and apply |
+1. Stage 1 renders prompts with the tokenizer's own chat template, so the template has a
+   single source of truth and training input matches what vLLM will build at inference.
+2. Stage 2 exports a HuggingFace model directory (`config.json` + safetensors +
+   tokenizer), which vLLM loads as-is.
+3. Stages 3 and 4 point at the same immutable version directory, so what you evaluated is
+   what you serve.
 
-**One important negative guarantee**: atomically replacing a symlink is **not a
-snapshot**. It only guarantees that a reader sees either the complete old link or the
-complete new link; it **does not guarantee that a series of subsequent opens all belong
-to the same version**. So "atomic symlink switching" by itself cannot deliver "a running
-training job will never have its data pulled out from under it" — that comes from the
-consumer resolving once and pinning the result. An early version had only the former and
-not the latter, which means it did not have this guarantee at all.
+Artifacts go into versioned directories created exclusively — never overwritten.
+Consumers resolve the convenience symlink into an immutable path once at startup, because
+atomically replacing a symlink is *not* a snapshot.
 
-By the same logic, **stage 4's `model_source` must not point at a symlink**: weights
-already loaded into GPU memory are not reloaded because a symlink on disk changed, and
-changing it gets you "I thought I released it but I didn't" plus "old and new replicas
-running side by side". A release is one explicit configuration change.
+## Who owns what
 
-## 3. Version matrix
+Confusing these five layers is the most common source of rework:
 
-| Component | Version | Rationale |
-| --- | --- | --- |
-| KubeRay | v1.7.0 (chart 1.7.0) | the current latest release; `ray.io/v1alpha1` is marked deprecated, so this directory uses `ray.io/v1` throughout |
-| Ray | 2.58.0 | the current latest release; Train V2 is on by default |
-| Image | `rayproject/ray-llm:2.58.0-py312-cu130` | this tag is confirmed to exist. It bundles vLLM and transformers, and all four stages share the same image to reduce version drift |
-| Kubernetes | ≥ 1.28 | needs a GPU device plugin or the GPU Operator |
-| Base model | `Qwen/Qwen2.5-0.5B-Instruct` | publicly downloadable, trainable on a single GPU, used to get the pipeline running; see section 8 for scaling up |
+| Layer | Component | Owns | Does not own |
+| --- | --- | --- | --- |
+| Resources | Kubernetes | node placement, quota, GPU devices, storage | has no concept of an epoch or a KV cache |
+| Orchestration | KubeRay Operator | RayJob / RayService lifecycles | no operator-level scheduling, no model loading |
+| Runtime | Ray (Core / Data / Train / Serve) | task and actor scheduling inside the cluster, data sharding, worker groups, service replicas | does not provision nodes; **logical GPU quota is not memory isolation** |
+| Compute | PyTorch | forward/backward, DDP/FSDP collectives, optimizer | does not know where data comes from |
+| Engine | vLLM | continuous batching, PagedAttention, KV cache, OpenAI protocol | does not decide replica counts or routing |
 
-The exact vLLM version is determined by the image — do not pin it separately. To check
-it, exec into a Pod and run `pip show vllm`.
+In one line: **Kubernetes gives resources, KubeRay gives a Ray cluster, Ray gives
+parallelism, PyTorch trains, vLLM serves.**
 
-## 4. Prerequisites
+## Layout
+
+```
+00-platform/   namespace, shared RWX PVC, HF token example
+10-data/       prepare_data.py  + RayJob    stage 1
+20-train/      train_sft.py     + RayJob    stage 2
+30-batch/      batch_infer.py   + RayJob    stage 3
+40-serve/      RayService       + smoke_test.sh   stage 4
+Makefile       one target per stage
+wait_rayjob.sh polls status.jobStatus (see "Non-obvious decisions" #1)
+```
+
+## Prerequisites
 
 ```bash
-# 1. GPUs are schedulable (you should see nvidia.com/gpu capacity)
+# GPUs are schedulable (you should see nvidia.com/gpu capacity)
 kubectl get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.capacity.'nvidia\.com/gpu'
 
-# 2. There is a StorageClass that supports ReadWriteMany
+# An RWX StorageClass exists
 kubectl get storageclass
 ```
 
-- At least 2 GPUs (stage 2 uses 2 workers with 1 GPU each). With only 1 GPU, set both
-  `NUM_WORKERS` and `replicas` to 1.
-- You **must** change `storageClassName` in `00-platform/storage.yaml` from
-  `REPLACE_WITH_RWX_STORAGE_CLASS` to the RWX class your cluster actually has
-  (`efs-sc` on EKS, `standard-rwx` / Filestore CSI on GKE). See section 7 if you have no
-  RWX. Do not change it to an empty string — in K8s an explicit
-  `storageClassName: ""` means "use no StorageClass at all", which **disables** dynamic
-  provisioning by the default class; the PVC can then only bind to a static PV that is
-  likewise class-less, and otherwise stays Pending forever. (To use the default class you
-  omit the field entirely, but the default class usually supports RWO only.)
-- The namespace is hardcoded as `llm-pipeline` in the manifests, and the Makefile
-  **does not offer** an override variable. This directory does not pull in a template
-  engine, so the manifests' `namespace:` field cannot follow a Make variable; offering an
-  override would only create the mismatch of "ConfigMap created in A, RayJob running in
-  B". To change the namespace, edit the manifests or wrap them in your own kustomize
-  layer.
-- You only need an HF token to pull gated models:
+- **At least 2 GPUs** (stage 2 uses 2 workers × 1 card). With one card, set `NUM_WORKERS`
+  and `replicas` to 1.
+- **Fill in `00-platform/storage.yaml`**: replace `REPLACE_WITH_RWX_STORAGE_CLASS` with a
+  StorageClass that really supports ReadWriteMany (EKS `efs-sc`, GKE `standard-rwx` /
+  Filestore CSI). Do **not** set it to the empty string — in Kubernetes an explicit
+  `storageClassName: ""` means "use no StorageClass", which *disables* dynamic
+  provisioning and leaves the PVC Pending unless a matching class-less PV exists.
+  (Omitting the field entirely is what selects the default class, but default classes are
+  usually RWO, which fails for multi-node training.)
+- The namespace is hard-coded to `llm-pipeline` in the manifests and the Makefile
+  deliberately does not let you override it — without a templating engine, an override
+  only produces a split where the ConfigMap lands in one namespace and the RayJobs run in
+  another. Edit the manifests, or wrap them in kustomize.
+- An HF token is only needed for gated models; Qwen2.5 is public:
   `kubectl -n llm-pipeline create secret generic hf-token --from-literal=hf_token="$HF_TOKEN"`
 
-## 5. Running it end to end
+## Running it
 
 ```bash
-make operator     # install the KubeRay Operator
+make operator     # install KubeRay Operator v1.7.0
 make platform     # namespace + shared PVC
-make data         # stage 1: data processing
-make train        # stage 2: SFT training
-make batch        # stage 3: offline batch inference
-                  # ↓ before this step, replace the model_source in
-                  #   rayservice-llm.yaml with the version stage 2 exported;
-                  #   make serve will stop you on the placeholder
-make serve        # stage 4: bring up the online service
-make test         # acceptance: models / non-streaming / stream completeness / incremental delivery
+make data         # stage 1
+make train        # stage 2
+make batch        # stage 3
+                  # ↓ before this, replace REPLACE_WITH_SFT_RUN_ID in
+                  #   40-serve/rayservice-llm.yaml with the version stage 2 exported
+make serve        # stage 4
+make test         # acceptance checks against the live endpoint
 ```
 
-The `make` targets for the three job stages all do the same thing: "delete the old
-RayJob of the same name → apply → poll with `wait_rayjob.sh`".
+The three job stages each delete the previous same-named RayJob, apply, then poll with
+`wait_rayjob.sh`. `make serve` refuses to run while the `model_source` placeholder is
+still in place.
 
-**Do not use `kubectl wait --for=condition=Complete rayjob/...`**: KubeRay v1.7.0's
-`RayJobStatus` has no `Conditions` field (only `jobStatus` / `jobDeploymentStatus`), so
-that condition never appears and even a successful job waits until the timeout. And
-`jobDeploymentStatus=Complete` is not a success signal either — `IsJobDeploymentTerminal`
-returns true for both `Complete` and `Failed`. The real criterion is
-`status.jobStatus == SUCCEEDED`.
+## Version baseline
 
-### Stage 1 · Data processing (`10-data/`)
-
-Ray Data's map/filter/groupby run in parallel on CPU workers: drop empty samples →
-exact dedupe by content hash → **carve out a deterministic, disjoint holdout** → apply
-the chat template and tokenize → **pad to a fixed length** → write parquet +
-`eval.jsonl` + `manifest.json`.
-
-Fixed-length padding is not laziness; it lets stage 2's `iter_torch_batches` assemble
-rectangular tensors directly, with no custom collate_fn. In labels, both the prompt
-segment and the padding segment are set to `-100`, so loss is computed only over the
-answer.
-
-Overlength samples have an explicit policy: **the prompt is never truncated**
-(truncating it would break template consistency), **the answer may be truncated but eos
-is always preserved**, and if the supervision budget is insufficient the whole sample is
-discarded and counted. Without this, when the prompt fills `max_len` the labels are all
-`-100`, and a whole batch with zero supervision turns cross entropy into `nan`, ruining
-the weights with no error message.
-
-**Acceptance check**: `data/tokenized/current/` contains parquet + `eval.jsonl` +
-`manifest.json`, and `train_rows + eval_rows == deduped_rows`.
-
-### Stage 2 · Training (`20-train/`)
-
-`TorchTrainer` starts N workers (1 GPU each); `ray.train.torch.prepare_model` handles
-device placement and the parallel wrapper, and `PARALLEL_STRATEGY` switches between
-`ddp` and `fsdp`. At the end of each epoch the weights are saved in **HuggingFace
-directory format** (`config.json` + safetensors + tokenizer), so vLLM can load it
-directly as a `model_source` — no conversion script is needed between training and
-inference.
-
-Recovery goes through Train V2's `get_checkpoint()`, and **weights, optimizer state and
-epoch are all loaded from the checkpoint**. Reading back only the epoch number while
-leaving the model at the base weights silently discards the training already done, and
-every metric still looks fine — worse than not recovering at all.
-
-The `fsdp` branch applies when "the model fits on one GPU but cannot be trained there"
-(0.5B–13B). `prepare_model` calls `model.to(device)` before wrapping in FSDP, so it is
-not a switch for "training bigger models"; see
-[training article §3.4](20-train/sft-training.en.md).
-
-**Acceptance check**: loss decreases epoch over epoch and `skipped=0`;
-`models/sft-current` points at the new directory, which contains `config.json`,
-`*.safetensors` and `pipeline_provenance.json` (recording which data was used).
-
-### Stage 3 · Offline batch inference (`30-batch/`)
-
-`vLLMEngineProcessorConfig` + `build_processor` turn vLLM into a single Ray Data
-operator. `concurrency` decides how many engine actors are started, and `batch_size`
-decides how many rows go into each batch. There is no HTTP layer and no latency target;
-the goal is throughput.
-
-Change `preprocess` in the same code to "have the model generate answers for unlabeled
-data" and you have data synthesis — which is exactly why "data processing" and
-"inference" are the same set of operators on Ray.
-
-At the start it `resolve()`s the `models/sft-current` and eval-set symlinks into
-immutable versions and prints them, so "which version was evaluated" is on the record
-and a mid-flight rerun cannot mix output from two models.
-
-The end is an acceptance check that **will fail the job**: it checks across all rows
-that `generated` is a non-empty string (not the "looks non-empty" kind like
-`str(None)`), exits non-zero if the check fails, and writes the verdict into
-`acceptance.json`. An "acceptance check" that only prints and never raises is no
-acceptance check at all — downstream can start regardless.
-
-**Acceptance check**: `acceptance.json` has `passed: true` and `rows_unusable: 0`, and
-its `model_version` matches stage 2's `pipeline_provenance.json`.
-
-### Stage 4 · Online serving (`40-serve/`)
-
-The RayService's `import_path` points at Ray's own builder
-`ray.serve.llm:build_openai_app`, and `args.llm_configs` is simply the `LLMConfig`
-fields. Autoscaling goes by `target_ongoing_requests` (in-flight requests per replica)
-rather than CPU utilization.
-
-Two things must be turned on / written correctly: `enableInTreeAutoscaling: true`
-(otherwise Serve gets no GPU worker when it scales replicas out, and `maxReplicas` is
-decorative), and `model_source` naming the immutable version (otherwise changing the
-symlink has no effect).
-
-**Acceptance check**: all four checks in `make test` pass — models matches exactly,
-non-streaming returns real content and a finish_reason, the stream is complete (has
-content deltas + has `[DONE]` + no error + curl did not fail), and **incremental
-delivery is judged by arrival time**. Counting SSE lines cannot detect buffering: a
-proxy can buffer the complete response and then deliver all event lines at once.
-
-## 6. Ten things that will actually block you
-
-All of these were established from the source, not general-purpose "best practice"
-advice. **Numbers ①③④⑤⑧⑨⑩ all really did occur in an early version of this
-directory**; a round of technical review found each of them (the record is in
-[REVIEW.md](REVIEW.md), all 13 findings reproduced and confirmed).
-
-**⓪ `kubectl wait --for=condition=Complete rayjob/...` will never succeed.**
-KubeRay v1.7.0's `RayJobStatus` has **no `Conditions` field**, so that condition does not
-exist and even a successful job waits until the timeout. And
-`jobDeploymentStatus=Complete` is not a success signal either
-(`IsJobDeploymentTerminal` returns true for both `Complete` and `Failed`). The only
-criterion is `status.jobStatus == SUCCEEDED`; see `wait_rayjob.sh`.
-
-**① For a RayService worker's readiness probe, either write none or write all of it.**
-KubeRay injects its combined probe only when the user has **not** declared a
-`readinessProbe` (raylet health + Serve proxy `/-/healthz`, with `failureThreshold: 1`).
-Write your own and omit `/-/healthz`, and the Pod enters Endpoints before the engine has
-finished loading, so requests 5xx immediately. `40-serve/rayservice-llm.yaml` explicitly
-reproduces that combination.
-
-**② `/dev/shm` defaults to 64MB.** The PyTorch DataLoader, NCCL and vLLM's
-inter-process communication all go through shared memory. Without an
-`emptyDir: {medium: Memory}` mounted at `/dev/shm`, training hangs or hits a bus error,
-and the error message points nowhere near the real cause.
-
-**③ `NUM_WORKERS` must equal the total number of GPU workers.** Too few wastes GPUs;
-too many leaves Ray Train waiting forever for workers, with the job stuck in
-Initializing and no error.
-
-**④ Under FSDP, `model.state_dict()` gives you a shard.** You must collect it inside an
-`FSDP.state_dict_type(FULL_STATE_DICT, rank0_only=True)` context, and this is a
-**collective communication** — every rank has to enter the call, and calling it only on
-rank 0 hangs outright.
-
-**⑤ In Ray Train V2, `TorchTrainer.restore` is deprecated.** 2.58 enables V2 by default
-(`is_v2_enabled()` defaults to `True`). Material online, and some official examples,
-still use the `can_restore` / `restore` form; under V2 that becomes
-`resume_from_checkpoint` together with `ray.train.get_checkpoint()`.
-
-**⑥ RayService's default upgrade strategy doubles your GPU requirement.**
-`NewCluster` brings up a pending cluster first and cuts traffic over once it is ready.
-When GPUs are tight the new cluster cannot start, and the service stays stuck on the old
-version. As of v1.7.0, `NewClusterWithIncrementalUpgrade` is beta and enabled by
-default, but it requires the Gateway API. Do not assume upgrades always need zero extra
-GPUs.
-
-**⑦ Configuring only Serve's `autoscaling_config` will not scale anything.** It only
-decides the number of Serve replicas; adding Ray worker Pods needs
-`enableInTreeAutoscaling: true`. Without it, `workerGroupSpecs.maxReplicas` is
-decorative and replicas sit in PENDING — the symptom is "autoscaling is configured but
-never scales".
-
-**⑧ Resuming training must load the weights, not just the epoch number.** Skipping
-epochs while the model stays at the base weights silently discards what you already
-have, while the loss curve, the checkpoints and the job status all look normal. You must
-`from_pretrained` from the checkpoint directory, and under FSDP the optimizer state has
-to go through `FSDP.optim_state_dict()` / `optim_state_dict_to_load()` (also collective
-operations).
-
-**⑨ Under FSDP, gradient clipping must use `model.clip_grad_norm_()`.**
-`torch.nn.utils.clip_grad_norm_` computes the norm of this rank's shard, and each rank
-scales independently — nothing crashes or hangs, training stability just quietly gets
-worse. Also, without an `auto_wrap_policy` FSDP has a single root unit, the forward pass
-all-gathers every parameter at once, and the GPU memory saving is close to zero.
-
-**⑩ `result.checkpoint` is the latest, not the best.** The Train V2 docs state plainly
-that `checkpoint` = latest; for the best one use `get_best_checkpoint(metric, mode)`.
-Configuring `checkpoint_score_attribute` and then exporting `result.checkpoint` is a
-self-contradictory policy.
-
-**Two deprecated/ineffective knobs**: `deploymentUnhealthySecondThreshold` and
-`serviceUnhealthySecondThreshold` are marked "Deprecated: This field is not used
-anymore" as of v1.7.0, so setting them does nothing. `storageClassName: ""` does not
-mean "use the default class" but "use no class", and it disables dynamic provisioning.
-
-**Two things about liveness / termination**: loading a large model can take minutes, so
-the worker's liveness `failureThreshold × periodSeconds` must exceed the load time, or
-the Pod gets restarted repeatedly mid-load and it looks like "the model is too big to
-start". For a streaming service, `terminationGracePeriodSeconds` must exceed the p99
-single-request generation time, or a rolling release cuts off connections that are
-halfway through emitting tokens.
-
-**One last item that is not in the code but matters just as much: the acceptance script
-itself needs to be accepted.** The early smoke test in this directory would report
-"all three checks passed" for a service that returned `{}`, had nothing but an error
-event in the stream, and made curl exit on a timeout. A check that never fails is worse
-than no check, because it gives false confidence. The current version has been
-negatively validated against five fixtures.
-
-## 7. What to do without an RWX volume
-
-Switch to object storage; three replacements are enough, and you no longer need the PVC:
-
-| Location | Change to |
+| Component | Version |
 | --- | --- |
-| Stage 1 output | `write_parquet("s3://bucket/data/tokenized/v-<id>")` |
-| Stage 2 `RunConfig` | `storage_path="s3://bucket/train"` |
-| Stage 4 `model_source` | `{bucket_uri: "s3://bucket/models/sft-<id>"}` (the `CloudMirrorConfig` form) |
+| KubeRay | v1.7.0 (helm chart 1.7.0) |
+| Ray | 2.58.0 (Train V2 enabled by default) |
+| Image | `rayproject/ray-llm:2.58.0-py312-cu130` |
+| Kubernetes | 1.28+ |
+| Base model | `Qwen/Qwen2.5-0.5B-Instruct` |
 
-The cost is that you have no symlinks, so "the current version" has to be expressed
-through an explicit version number or a pointer file, and the release process changes
-accordingly to rewriting `bucket_uri` inside `serveConfigV2`. Ray Train explicitly
-requires shared storage for multi-node training; a local path only works on a single
-node.
+vLLM comes from the image; do not pin it separately. Deviating from these versions is
+fine, but re-check the fields — several of the ones this code depends on moved or were
+deprecated recently.
 
-## 8. Scaling from 0.5B to 7B / 70B
+## Non-obvious decisions in this code
 
-| Dimension | 0.5B (this directory's default) | 7B | 70B |
+Read this before "fixing" anything that looks odd. Most of these were real defects in an
+earlier revision, found in review and fixed; reverting them reintroduces the bug.
+
+1. **`wait_rayjob.sh` exists because `kubectl wait --for=condition=Complete rayjob/...`
+   can never succeed.** KubeRay v1.7.0's `RayJobStatus` has no `Conditions` field, so that
+   condition never appears and even a successful job waits until the timeout.
+   `jobDeploymentStatus=Complete` is not a success signal either —
+   `IsJobDeploymentTerminal` returns true for both `Complete` and `Failed`. The only
+   criterion is `status.jobStatus == SUCCEEDED`.
+2. **The RayService worker's `readinessProbe` is spelled out on purpose.** KubeRay injects
+   its combined probe (raylet health + Serve proxy `/-/healthz`, `failureThreshold: 1`)
+   *only when the user has declared none*. Declaring your own and omitting `/-/healthz`
+   admits traffic before the engine has loaded weights, so requests 5xx. Either write none
+   and let KubeRay inject, or write all of it — there is no safe middle.
+3. **`/dev/shm` is mounted as a memory-backed `emptyDir`** in every GPU pod. The container
+   default is 64MB; the PyTorch DataLoader, NCCL and vLLM's inter-process communication all
+   use shared memory. Without it, training hangs or hits a bus error, and the message
+   points nowhere near the cause. Note it counts against the container memory limit.
+4. **`enableInTreeAutoscaling: true` is required** for Serve to scale. The Serve
+   `autoscaling_config` only decides replica counts; adding Ray worker Pods is the Ray
+   autoscaler's job. Without it, `workerGroupSpecs.maxReplicas` is decorative and replicas
+   sit PENDING.
+5. **`model_source` must be an immutable version directory, not the `sft-current`
+   symlink.** Weights already in GPU memory are never reloaded because a symlink changed;
+   editing `serveConfigV2` is what triggers a Serve update. Pointing at the symlink gives
+   you "I thought I shipped it" plus old and new replicas serving side by side.
+6. **Resume loads weights, optimizer state and epoch — all three.** Restoring only the
+   epoch number leaves the model on base weights and silently discards prior training
+   while the loss curve, checkpoints and job status all look healthy.
+7. **FSDP paths use `model.clip_grad_norm_()` and an `auto_wrap_policy`.**
+   `torch.nn.utils.clip_grad_norm_` clips each rank's *shard* norm, not the global norm.
+   Without `auto_wrap_policy`, FSDP wraps the model as one flat unit and all-gathers every
+   parameter at once, so the memory saving is close to zero. Also note `prepare_model`
+   moves the model to the device *before* wrapping, so this path still requires the model
+   to fit on one GPU.
+8. **Export uses `result.get_best_checkpoint("loss", "min")`, not `result.checkpoint`** —
+   Ray Train V2 defines `checkpoint` as the *latest*, which quietly contradicts a
+   `checkpoint_score_attribute` config. The score is rank 0's unweighted mean of training
+   batch losses, not a validation metric; it catches a blown final epoch, nothing more.
+9. **Over-length samples have an explicit policy** (`10-data/prepare_data.py`): the prompt
+   is never truncated (that would break template consistency), the answer may be truncated
+   but always keeps its EOS, and a sample whose supervision budget is too small is
+   rejected and counted. Concatenate-then-truncate instead, and a prompt that fills
+   `max_len` produces all-`-100` labels — a whole batch of those makes cross-entropy `nan`
+   and destroys the weights, with no error.
+10. **`smoke_test.sh` checks streaming by arrival timing, not by counting `data:` lines.**
+    A proxy can buffer a complete response and deliver every event line at once; the line
+    count is identical. Its predecessor passed a service that returned `{}`, emitted only
+    an error event, and exited with a curl timeout.
+11. **`deploymentUnhealthySecondThreshold` is deliberately absent.** KubeRay v1.7.0 marks
+    it and `serviceUnhealthySecondThreshold` "Deprecated: This field is not used anymore".
+    Slow model loading is protected by the worker's liveness `failureThreshold` instead.
+
+Two more thresholds worth knowing: the worker liveness
+`failureThreshold × periodSeconds` must exceed model load time or Pods restart mid-load
+(looks like "the model is too big to start"), and `terminationGracePeriodSeconds` must
+exceed p99 single-request generation time or a rollout cuts streams that have already
+delivered half their tokens.
+
+## Without an RWX volume
+
+Switch to object storage; three replacements, and the PVC is no longer needed:
+
+| Where | Change to |
+| --- | --- |
+| stage 1 output | `write_parquet("s3://bucket/data/tokenized/v-<id>")` |
+| stage 2 `RunConfig` | `storage_path="s3://bucket/train"` |
+| stage 4 `model_source` | `{bucket_uri: "s3://bucket/models/sft-<id>"}` (`CloudMirrorConfig` form) |
+
+The cost is that there are no symlinks and no atomic rename, so "current version" has to
+be expressed by an explicit version number or a pointer file, and publishing becomes an
+edit to `bucket_uri` in `serveConfigV2`. Ray Train requires shared storage for multi-node
+training; a local path only works on a single node.
+
+## Scaling up
+
+| Model | `PARALLEL_STRATEGY` | GPUs | Does this code still apply? |
 | --- | --- | --- | --- |
-| Training parallelism | `PARALLEL_STRATEGY=ddp` | `fsdp` | `fsdp` + activation recomputation, consider DeepSpeed ZeRO-3 |
-| GPU | 2 × 24GB | 8 × 80GB | multi-node, needs high-bandwidth interconnect |
-| Inference `tensor_parallel_size` | 1 | 1 (80GB cards) or 2 | 4–8, plus a multi-host worker group with `numOfHosts` > 1 |
-| Gang scheduling | not needed | recommended | required: plug in Kueue or Volcano so half a training group does not hold GPUs waiting for the other half |
-| Load time | seconds | minutes | several minutes or more, so liveness thresholds must be raised to match |
+| 0.5B (default) | `ddp` | 2 × 24GB | yes |
+| 7B | `fsdp` | 8 × 80GB | mostly — add gang scheduling (Kueue/Volcano), budget PVC for 14GB checkpoints, raise liveness thresholds for minute-scale loads |
+| 70B | — | multi-node | **no** — see below |
 
-When scaling up, the changes concentrate in three places: the workers' `resources` and
-`replicas`, training's `PARALLEL_STRATEGY`, and inference's `tensor_parallel_size`. The
-application code does not change — which is exactly the payoff of handing the
-parallelism strategy to Ray + PyTorch instead of writing it yourself.
+At 70B three things block this code, and none is a config change: every rank loads a full
+model before FSDP wraps it, so initialization OOMs; `FULL_STATE_DICT` with CPU offload has
+to assemble 140GB on rank 0 before writing; and epoch-level recovery means one preemption
+costs a whole epoch. That range needs meta-device init or FSDP2/DeepSpeed ZeRO-3, sharded
+checkpoints, and step-level recovery. This code targets models that fit on one card but
+cannot be *trained* on one card — roughly 0.5B to 13B on 80GB.
 
-## 9. Where to hook up observability
+Three numbers move together and must be recomputed as a set:
 
-- **Ray Dashboard**: `kubectl -n llm-pipeline port-forward svc/<head-svc> 8265:8265`,
-  to see task/actor distribution, per-GPU utilization, and Serve replica status.
-- **vLLM engine metrics**: you only get TTFT, queue depth and KV cache hit rate after
-  turning on `LLMConfig.log_engine_metrics: true`. Autoscaling and capacity planning
-  rely on this set of metrics, not on CPU utilization.
-- **Layered troubleshooting order** (a failure must be verified layer by layer; you
-  cannot look only at the outermost one):
-  1. is the Pod Running and Ready (K8s layer);
-  2. are all Ray nodes in the RayCluster registered (Ray layer);
-  3. are the Serve application and replicas RUNNING (application layer);
-  4. can the engine actually generate (`/v1/chat/completions`).
-  Only when step 4 passes is the service "available"; all-green on the first three with
-  step 4 failing is a common combination.
+```
+stage 1 MAX_LEN + MAX_TOKENS  ≤  stage 4 max_model_len
+                                 └─ sets per-sequence KV cache size
+                                    └─ with gpu_memory_utilization, sets the token budget
+                                       └─ which bounds target_ongoing_requests
+```
 
-## 10. How far this has actually been verified
+KV cache per token is `2 × layers × kv_heads × head_dim × dtype_bytes` — note **kv_heads**
+(GQA), not attention heads; using the latter overestimates by an order of magnitude. For
+Qwen2.5-7B that is 56 KiB/token, so a single 80GB card at `gpu_memory_utilization: 0.85`
+holds roughly 920K tokens ≈ 900 concurrent sequences at 1K tokens each. The default
+`target_ongoing_requests: 32` is tuned for the 0.5B/24GB case and is far too conservative
+at 7B.
 
-**API and field checks** (against pinned source, not paraphrased official docs):
+## Observability
+
+- **Ray Dashboard**: `kubectl -n llm-pipeline port-forward svc/<head-svc> 8265:8265` for
+  task/actor placement, per-GPU occupancy and Serve replica status.
+- **vLLM engine metrics** require `log_engine_metrics: true` in `LLMConfig`; only then do
+  you get TTFT, TPOT/ITL, engine queue depth, KV cache utilization and prefix cache hit
+  rate. Capacity planning and autoscaling need these, not CPU utilization.
+- **Diagnose in layers.** Pods Ready (K8s) → Ray nodes registered (Ray) → Serve
+  application and replicas RUNNING (app) → the engine actually generates
+  (`/v1/chat/completions`). Only the fourth means "the service works"; the first three
+  green with the fourth failing is a common combination.
+
+## Verification scope
+
+**Checked against pinned upstream source:**
 
 - KubeRay v1.7.0's `ray.io/v1` RayJob / RayService fields, `upgradeStrategy` values,
-  `autoscalerOptions` fields, `enableInTreeAutoscaling`;
-- `RayJobStatus` has **no** `Conditions` field; the `RayServiceReady = "Ready"`
-  condition **does exist** (so RayJob cannot use `kubectl wait --for=condition` while
-  RayService can);
-- `deploymentUnhealthySecondThreshold` / `serviceUnhealthySecondThreshold` are marked
-  "Deprecated: This field is not used anymore";
-- KubeRay's probe injection logic: a user-declared probe takes precedence; the
-  RayService worker's combined probe (raylet + Serve proxy, `failureThreshold: 1`) is
-  **injected only when none is declared** — the logic is the same in v1.4.2 and
-  v1.7.0;
-- Ray 2.58.0's `ray.data.llm` exports the name `build_processor` (`build_llm_processor`
-  is no longer in `__all__`), and the `vLLMEngineProcessorConfig` fields;
-- the `LLMConfig` / `ModelLoadingConfig` / `CloudMirrorConfig` fields of
-  `ray.serve.llm`;
-- Ray Train V2 is on by default (`is_v2_enabled()` defaults to `True`), `restore` /
-  `can_restore` are deprecated, `Result.checkpoint` is the **latest** while
-  `get_best_checkpoint(metric, mode)` is a separate thing, and `prepare_model`
-  **calls `.to(device)` first and then wraps**, passing no `auto_wrap_policy` by
-  default;
-- torch 2.7's `FSDP.clip_grad_norm_` / `optim_state_dict` / `optim_state_dict_to_load`
-  and `ModuleWrapPolicy`;
-- the existence of the `rayproject/ray-llm:2.58.0-py312-cu130` image tag and of helm
-  chart `1.7.0`.
+  `autoscalerOptions`, `enableInTreeAutoscaling`
+- `RayJobStatus` has **no** `Conditions` field; `RayServiceReady = "Ready"` **does** exist
+  (so RayJob cannot use `kubectl wait --for=condition`, RayService can)
+- `deploymentUnhealthySecondThreshold` / `serviceUnhealthySecondThreshold` marked
+  deprecated and unused
+- KubeRay's probe injection: a user-declared probe wins; the RayService worker's combined
+  probe is injected only when none is declared — identical logic in v1.4.2 and v1.7.0
+- Ray 2.58.0 `ray.data.llm` exports `build_processor` (`build_llm_processor` is no longer
+  in `__all__`); `vLLMEngineProcessorConfig` fields
+- `ray.serve.llm`'s `LLMConfig` / `ModelLoadingConfig` / `CloudMirrorConfig` fields
+- Ray Train V2 on by default; `restore` / `can_restore` deprecated; `Result.checkpoint` is
+  the latest while `get_best_checkpoint(metric, mode)` is separate; `prepare_model` moves
+  to device **before** wrapping and passes no `auto_wrap_policy` by default
+- torch 2.7's `FSDP.clip_grad_norm_` / `optim_state_dict` / `optim_state_dict_to_load`,
+  and `ModuleWrapPolicy`
+- `rayproject/ray-llm:2.58.0-py312-cu130` and helm chart `1.7.0` exist
 
-**Checks actually executed locally** (no Ray, no GPU, no cluster):
+**Executed locally (no Ray, no GPU, no cluster):**
 
-- the four Ray CRs were validated with jsonschema against KubeRay v1.7.0's **real CRD
-  schema**, and all are valid;
-- `wait_rayjob.sh` behaves correctly on 6 status fixtures (including "deployment
-  Complete but job FAILED must not be mistaken for success");
-- `smoke_test.sh` behaves correctly on 5 fixtures (empty `{}`, error event, curl
-  timeout, buffered stream, missing `[DONE]`, protocol frames only → all fail
-  correctly; incremental arrival and complete → passes);
-- `Tokenize._encode` was run on boundary cases with a synthetic tokenizer:
-  zero-supervision samples are discarded, and for accepted samples eos is always the
-  last token of the supervised segment (whether truncated or not);
-- Python compilation, YAML parsing, the embedded YAML field inside `serveConfigV2`,
-  Makefile parsing, and reachability of in-repo links.
+- all four Ray custom resources validate against the real KubeRay v1.7.0 CRD schemas
+- `wait_rayjob.sh` behaves correctly across 6 status fixtures, including "deployment
+  Complete but job FAILED must not be read as success"
+- `smoke_test.sh` behaves correctly across 5 fixtures: empty `{}`, an error event, a curl
+  timeout, a buffered burst and a missing `[DONE]` all fail; incremental and complete passes
+- `Tokenize._encode` boundary behaviour: zero-supervision samples are rejected, and every
+  accepted sample ends its supervised span with EOS whether or not the answer was truncated
+- Python compiles, YAML parses (including the embedded `serveConfigV2`), Makefile parses
 
-**Not verified**: **this pipeline has never been executed on a real GPU cluster.** So
-whether training converges, whether GPU memory suffices, how long loading takes, whether
-the probe thresholds are appropriate, the real behavior of FSDP's state_dict / optimizer
-state under a specific torch version, and the actual GPU-memory benefit of
-`auto_wrap_policy` all need a first real run to confirm. After dedup, the demo data is
-only 8 template samples (6 train / 2 eval), so a falling loss only proves the pipeline
-works, not that the training is effective.
+**Not verified:** never executed on a real GPU cluster. Training convergence, memory
+headroom, load times, whether the probe thresholds are right, the real behaviour of FSDP
+state-dict and optimizer-state collectives on a specific torch build, and the actual
+memory saving from `auto_wrap_policy` all need a first real run. The bundled demo dataset
+is 8 template rows (6 train / 2 eval) — a falling loss proves the chain is wired, not that
+training works.
 
-**Review record**: [REVIEW.md](REVIEW.md) is an independent technical review of this
-directory; all 13 findings (7 of them P1) **were reproduced and confirmed** and have
-been fixed, and the fixes were written back into the corresponding stage articles — "what
-the early version got wrong, why it was wrong, and how it was changed" has its own
-passage in all four articles, because those mistakes have more teaching value than
-correct code does.
+## License
 
-## 11. Layout and per-stage deep dives
-
-Every stage has its own article explaining where it sits in the LLM lifecycle, what it
-must accomplish, and **why the code and YAML are written the way they are** (including
-alternatives and their costs). This document is the overview; the details are in the four
-articles:
-
-| Stage | Code and manifests | Deep-dive article |
-| --- | --- | --- |
-| 1 · Data processing | `10-data/` | [Turning raw text into fixed-length tensors the trainer can eat directly](10-data/data-processing.en.md) |
-| 2 · SFT training | `20-train/` | [Turning fixed-length tensors into weights vLLM can load directly](20-train/sft-training.en.md) |
-| 3 · Offline batch inference | `30-batch/` | [Treating vLLM as a data operator](30-batch/batch-inference.en.md) |
-| 4 · Online serving | `40-serve/` | [Turning vLLM into an endpoint you can scale, upgrade and roll back](40-serve/online-serving.en.md) |
-
-```
-00-platform/    namespace, shared PVC, HF token example
-10-data/        prepare_data.py + RayJob + deep dive     (stage 1)
-20-train/       train_sft.py   + RayJob + deep dive     (stage 2)
-30-batch/       batch_infer.py + RayJob + deep dive     (stage 3)
-40-serve/       RayService + smoke_test.sh + deep dive  (stage 4)
-Makefile        seven commands that string the pipeline together
-wait_rayjob.sh  polls status.jobStatus for job completion (kubectl wait cannot be used)
-REVIEW.md       independent technical review record; all 13 findings confirmed and fixed
-```
-
-Three threads run through all four articles, and it helps to read them side by side:
-
-1. **Interface contracts**: each stage's artifacts are the next stage's direct input;
-   there is no conversion script anywhere in the pipeline.
-2. **Release pattern**: versioned artifact writes + atomic symlink switching + never
-   overwriting old versions.
-3. **Batch vs service semantics**: stages 1–3 are batch jobs (Burstable, destroyed when
-   done, rerun on failure), and stage 4 is a long-lived service (Guaranteed, gated by
-   probes, upgrades need a resource window).
-4. **The KV cache's role flips from stage to stage**: stage 1 only constrains it
-   indirectly through `MAX_LEN`, stage 2 explicitly **turns it off** (during training it
-   is pure wasted GPU memory), stage 3 turns it up close to the limit as a matter of
-   course, and in stage 4 it becomes **the entirety of capacity planning** — for the
-   formula and measured numbers see
-   [serving article §3.3](40-serve/online-serving.en.md).
-
-
-Adjacent topics this repository does not cover: where Ray's responsibilities end and
-Kubernetes' begin, the streaming semantics of a RayService zero-downtime upgrade, and
-distributed training via Kubeflow Trainer — the last is an independent alternative to the
-Ray Train route used here and is worth reading side by side.
+[Apache-2.0](LICENSE). Some code follows patterns from the Ray documentation, which is
+Apache-2.0 licensed.
